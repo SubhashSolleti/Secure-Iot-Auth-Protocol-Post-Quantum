@@ -47,6 +47,18 @@ This project implements a secure, quantum-resistant authentication system. It le
 | Crypto | Key exchange, signatures, encryption | ML-KEM-768, ML-DSA-65, AES-GCM |
 | Protocol | Async handshake + streaming | MsgPack, TCP/WebSocket |
 
+## 🔬 Algorithms
+
+| Algorithm     | Category      | Purpose                          | Security Notes                               |
+|---------------|--------------|----------------------------------|-----------------------------------------------|
+| **ML-KEM-768** | PQ KEM        | Key exchange (shared secret)     | NIST FIPS 203; Quantum-resistant              |
+| **X25519**     | Classical ECDH | Hybrid KEM (optional)            | Fast; ~128-bit classical security             |
+| **ML-DSA-65**  | PQ Signature   | Message signing (m₁/m₂ auth)     | NIST FIPS 204; EUF-CMA secure                 |
+| **AES-GCM**    | Symmetric AEAD | Encrypt + authenticate data      | 256-bit keys; Provides integrity + confidentiality |
+| **HKDF-SHA256**| KDF           | Derive K_sess + AEAD subkeys     | Domain-separated; cryptographically strong    |
+| **SHA-256**    | Hash Function | Pseudonyms, proofs, chain links  | Collision-resistant; Widely standardized      |
+
+
 ### Protocol Flow
 1. **Handshake**: Client/server exchange ephemeral keys (m1/m2), establish K_sess.
 2. **Pseudonym Provisioning**: Auto-register PSi with z_i/w_i for anonymity.
