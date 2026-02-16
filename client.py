@@ -1,14 +1,19 @@
 """
 Client – Post-Quantum Pseudonym-Based Authentication + Encrypted Streaming.
 
-Connects to the authentication server, performs the PQ handshake (m1–m5),
-verifies hash-chain integrity, then streams encrypted simulated sensor
-data over the established session key.
+Features:
+  • Hybrid ML-KEM-768 + X25519 key exchange
+  • ML-DSA-65 signature verification with server key pinning
+  • Session resumption via server-issued tickets
+  • TLS 1.3 transport (configurable)
+  • Automatic pseudonym rotation after N sessions
+  • Encrypted sensor-data streaming
+  • Structured JSON logging for SIEM integration
 """
 
 import asyncio
 import json
-import logging
+import os
 import secrets
 import struct
 import time
@@ -18,22 +23,38 @@ import msgpack
 from pqcrypto.sign.ml_dsa_65 import generate_keypair as sig_generate, sign, verify
 
 from config import (
-    HOST, PORT, TIME_DELTA_SEC, LOG_FORMAT,
-    PSI_LEN, NONCE_LEN, TS_LEN, ZI_LEN, WI_LEN,
+    HOST, PORT, TIME_DELTA_SEC,
+    PSI_LEN, NONCE_LEN, TS_LEN, ZI_LEN,
     STREAM_INTERVAL_SEC, STREAM_PACKET_COUNT,
+    TLS_ENABLED, PINNED_KEY_FILE,
 )
 from kem_adapter import kem_encaps, kem_name
+from log_setup import get_logger
 from pq_commons import (
     aead_encrypt, aead_decrypt, hkdf_sha256, sha256,
     derive_pseudonym, b32, Timer, pack, unpack,
 )
-from secrets_config import ID_REAL, SD, A_I, Z_I
+from secrets_config import ID_REAL, SD, A_I, Z_I, rotate_epoch
 
-# ── Logging ──────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+logger = get_logger("client")
 
 # ── Persistent state (would be persisted to flash / secure storage) ──────
-W_I: Optional[bytes] = None  # Set after first successful session
+W_I: Optional[bytes] = None            # Set after first successful session
+_session_ticket: Optional[bytes] = None  # Server-issued session ticket
+
+# ── Pinned server key ────────────────────────────────────────────────────
+_pinned_server_pk: Optional[bytes] = None
+
+
+def _load_pinned_key() -> Optional[bytes]:
+    """Load the pinned server public key if available."""
+    if os.path.isfile(PINNED_KEY_FILE):
+        with open(PINNED_KEY_FILE, "rb") as f:
+            return f.read()
+    return None
+
+
+_pinned_server_pk = _load_pinned_key()
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -66,20 +87,93 @@ def _generate_sensor_reading(seq: int) -> dict:
     }
 
 
+async def _send_stream(writer, reader, K_sess, PSi):
+    """Send encrypted sensor data and handle session ticket."""
+    logger.info("streaming_start")
+    for seq in range(1, STREAM_PACKET_COUNT + 1):
+        reading = _generate_sensor_reading(seq)
+        plaintext = json.dumps(reading).encode()
+        ad_stream = PSi
+        nonce_s, ctext_s = aead_encrypt(K_sess, ad_stream, plaintext)
+        await send_msg(writer, {
+            "type": "stream_data",
+            "ad": ad_stream,
+            "nonce": nonce_s,
+            "ciphertext": ctext_s,
+        })
+        logger.info("sensor_packet_sent", seq=seq)
+        await asyncio.sleep(STREAM_INTERVAL_SEC)
+
+    # Receive session ticket for future resumption
+    global _session_ticket
+    try:
+        msg = await asyncio.wait_for(recv_msg(reader), timeout=5.0)
+        if msg.get("type") in ("session_ticket", "new_ticket"):
+            _session_ticket = msg.get("ticket")
+            logger.info("session_ticket_received")
+    except (asyncio.TimeoutError, asyncio.IncompleteReadError):
+        logger.warning("no_session_ticket_received")
+
+
 # ── Main protocol ───────────────────────────────────────────────────────
 async def run_client() -> None:
-    reader, writer = await asyncio.open_connection(HOST, PORT)
+    global _pinned_server_pk, _session_ticket
+
+    ssl_ctx = None
+    if TLS_ENABLED:
+        from tls_utils import get_client_ssl_context
+        ssl_ctx = get_client_ssl_context()
+
+    reader, writer = await asyncio.open_connection(HOST, PORT, ssl=ssl_ctx)
 
     # ── Hello ────────────────────────────────────────────────────────────
     hello = await recv_msg(reader)
     serv_pub = hello.get("serv_pub")
+    server_sig_pk = hello.get("sig_pk")
     if not serv_pub:
-        logging.error("[client] Invalid hello from server")
+        logger.error("invalid_hello")
         return
-    logging.info(f"[client] Using KEM: {kem_name()}")
+    logger.info("connected", kem=kem_name(), tls=TLS_ENABLED)
+
+    # ── Pin server key on first contact ──────────────────────────────────
+    if _pinned_server_pk is None and server_sig_pk is not None:
+        _pinned_server_pk = server_sig_pk
+        with open(PINNED_KEY_FILE, "wb") as f:
+            f.write(server_sig_pk)
+        logger.info("server_key_pinned", path=PINNED_KEY_FILE)
+    elif _pinned_server_pk is not None and server_sig_pk is not None:
+        if not secrets.compare_digest(_pinned_server_pk, server_sig_pk):
+            logger.error("pinned_key_mismatch", msg="Server identity changed! Possible MITM attack.")
+            writer.close()
+            await writer.wait_closed()
+            raise RuntimeError("Server key does not match pinned key — aborting")
 
     t = Timer()
     t.start()
+
+    # ── Try session resumption ───────────────────────────────────────────
+    if _session_ticket is not None:
+        logger.info("attempting_resume")
+        await send_msg(writer, {"type": "resume", "ticket": _session_ticket})
+        _session_ticket = None  # one-time use
+        msg = await recv_msg(reader)
+        if msg.get("type") == "resume_ok":
+            logger.info("session_resumed")
+            PSi = derive_pseudonym(ID_REAL, SD, A_I)
+            # We don't have K_sess locally — the server does the lookup.
+            # Send streaming data with the LAST known K_sess.
+            # NOTE: In a real implementation, K_sess would be cached locally.
+            t.mark("resume-complete")
+            logger.info("resume_complete", latency_ms=round(t.marks["resume-complete"], 2))
+            # For demo, streaming handled by a separate flow
+            rotate_epoch()
+            logger.info("session_complete")
+            writer.close()
+            await writer.wait_closed()
+            return
+        else:
+            logger.info("resume_rejected", reason="ticket_expired_or_invalid")
+            # Fall through to full handshake
 
     # ── m1: Client → Server ──────────────────────────────────────────────
     sig_pk, sig_sk = sig_generate()
@@ -107,18 +201,25 @@ async def run_client() -> None:
     # ── m2: Server → Client ──────────────────────────────────────────────
     msg = await recv_msg(reader)
     if msg.get("type") == "err":
-        logging.error("[client] Server error: %s", msg.get("reason"))
+        logger.error("server_error", reason=msg.get("reason"))
         return
     if msg.get("type") != "m2":
-        logging.error("[client] Unexpected response: %s", msg)
+        logger.error("unexpected_response", msg=msg)
         return
 
     m2_payload = msg["payload"]
     m2_sig     = msg["sig"]
     m2_sig_pk  = msg["sig_pk"]
 
+    # ── Certificate pinning check ────────────────────────────────────────
+    if _pinned_server_pk is not None:
+        if not secrets.compare_digest(m2_sig_pk, _pinned_server_pk):
+            logger.error("m2_key_mismatch", msg="m2 signed with unknown key — rejecting")
+            await send_msg(writer, {"type": "err", "reason": "pinned-key-mismatch"})
+            return
+
     if not verify(m2_sig_pk, m2_payload, m2_sig):
-        logging.error("[client] Invalid m2 signature")
+        logger.error("invalid_m2_signature")
         await send_msg(writer, {"type": "err", "reason": "invalid-sig"})
         return
 
@@ -138,7 +239,7 @@ async def run_client() -> None:
     # Replay check
     t2_time = int.from_bytes(t2, "big")
     if abs(t2_time - int(time.time())) > TIME_DELTA_SEC:
-        logging.error("[client] Replay detected: t2 skew too large")
+        logger.error("replay_detected", field="t2", skew=abs(t2_time - int(time.time())))
         await send_msg(writer, {"type": "err", "reason": "replay"})
         return
 
@@ -146,11 +247,11 @@ async def run_client() -> None:
     if W_I is not None:
         expected_ziw = sha256(Z_I + W_I)
         if not secrets.compare_digest(ziw_received, expected_ziw):
-            logging.error("[client] zi+wi mismatch — server authentication failed")
+            logger.error("ziw_mismatch")
             await send_msg(writer, {"type": "err", "reason": "invalid-ziw"})
             return
     else:
-        logging.info("[client] First session — provisional trust (no w_i yet)")
+        logger.info("first_session_provisional_trust")
 
     K_sess = hkdf_sha256(ss + NEV + NS, info=b"kdf-sess", length=32)
 
@@ -169,44 +270,35 @@ async def run_client() -> None:
     # ── m5: Server → Client (liveness response) ─────────────────────────
     msg = await recv_msg(reader)
     if msg.get("type") != "m5":
-        logging.error("[client] Missing m5")
+        logger.error("missing_m5")
         return
     back = aead_decrypt(K_sess, m2["ad"], msg["nonce"], msg["ciphertext"])
     expected = (int.from_bytes(N_edge, "big") + 1) % (1 << (8 * len(N_edge)))
     ok = int.from_bytes(back, "big") == expected
-    logging.info(f"[client] Liveness ack: {ok}")
+    logger.info("liveness_ack", ok=ok)
 
     # ── Hash-chain verification ──────────────────────────────────────────
     msg = await recv_msg(reader)
     if msg.get("type") != "hash_head":
-        logging.error("[client] Missing hash_head")
+        logger.error("missing_hash_head")
         return
     head, n, pre = msg["head"], msg["n"], msg["pre"]
 
     t.mark("handshake-complete")
-    logging.info(f"[client] Handshake ~{t.marks['handshake-complete']:.2f} ms")
+    logger.info("handshake_complete", latency_ms=round(t.marks["handshake-complete"], 2))
 
     await send_msg(writer, {"type": "hash_use", "pre": pre})
     msg = await recv_msg(reader)
-    logging.info(f"[client] Hash-chain verification: {msg}")
+    logger.info("hash_chain_verified", result=msg)
 
     # ── Encrypted Data Streaming ─────────────────────────────────────────
-    logging.info("[client] 🚀 Streaming encrypted sensor data...")
-    for seq in range(1, STREAM_PACKET_COUNT + 1):
-        reading = _generate_sensor_reading(seq)
-        plaintext = json.dumps(reading).encode()
-        ad_stream = PSi
-        nonce_s, ctext_s = aead_encrypt(K_sess, ad_stream, plaintext)
-        await send_msg(writer, {
-            "type": "stream_data",
-            "ad": ad_stream,
-            "nonce": nonce_s,
-            "ciphertext": ctext_s,
-        })
-        logging.info(f"[client] 📤 Sent sensor packet #{seq}")
-        await asyncio.sleep(STREAM_INTERVAL_SEC)
+    await _send_stream(writer, reader, K_sess, PSi)
 
-    logging.info("[client] Session complete.")
+    # ── Pseudonym rotation ───────────────────────────────────────────────
+    new_a_i = rotate_epoch()
+    logger.info("epoch_check", a_i=new_a_i.hex()[:16])
+
+    logger.info("session_complete")
     writer.close()
     await writer.wait_closed()
 

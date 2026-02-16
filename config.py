@@ -19,9 +19,6 @@ DB_FILE = "server_pseudonyms.db"
 # "relaxed" → silently fall back to pure ML-KEM-768
 KEM_FALLBACK_POLICY = "strict"
 
-# ── Logging ──────────────────────────────────────────────────────────────
-LOG_FORMAT = "[%(levelname)s] %(message)s"
-
 # ── Byte-field sizes (avoids magic numbers in protocol code) ─────────────
 PSI_LEN   = 32   # pseudonym length
 NONCE_LEN = 32   # nonce / random bytes length
@@ -32,3 +29,25 @@ WI_LEN    = 32   # w_i witness length
 # ── Streaming ────────────────────────────────────────────────────────────
 STREAM_INTERVAL_SEC = 1.0    # seconds between simulated sensor packets
 STREAM_PACKET_COUNT = 5      # number of sensor packets to send in demo
+
+# ── Session Resumption ───────────────────────────────────────────────────
+SESSION_TICKET_TTL_SEC = 300  # session ticket validity (5 minutes)
+
+# ── Rate Limiting (token-bucket) ─────────────────────────────────────────
+RATE_LIMIT_PER_SEC = 10       # token refill rate per second
+RATE_LIMIT_BURST   = 20       # maximum burst size
+
+# ── TLS Transport ────────────────────────────────────────────────────────
+TLS_ENABLED = True            # wrap TCP in TLS 1.3
+CERTS_DIR   = "certs"         # directory for cert/key files
+
+# ── Pseudonym Rotation ───────────────────────────────────────────────────
+PSEUDONYM_ROTATE_EVERY = 5    # rotate A_I every N sessions
+
+# ── Logging ──────────────────────────────────────────────────────────────
+LOG_MODE   = "json"           # "json" for SIEM, "text" for human-readable
+LOG_FORMAT = "[%(levelname)s] %(message)s"  # fallback format if structlog unavailable
+
+# ── Certificate Pinning ──────────────────────────────────────────────────
+SERVER_IDENTITY_DIR = "server_identity"   # persistent ML-DSA signing key
+PINNED_KEY_FILE     = "pinned_server.pk"  # client-side pinned public key

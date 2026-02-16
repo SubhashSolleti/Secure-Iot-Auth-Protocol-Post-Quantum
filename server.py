@@ -1,14 +1,18 @@
 """
 Server – Post-Quantum Pseudonym-Based Authentication + Encrypted Streaming.
 
-Listens for IoT client connections, performs the PQ handshake (m1–m5),
-verifies hash-chain integrity, then receives encrypted sensor data
-over the established session key.
+Features:
+  • Hybrid ML-KEM-768 + X25519 key exchange
+  • ML-DSA-65 signatures with persistent (pinned) server identity
+  • Session resumption via encrypted session tickets
+  • Per-IP token-bucket rate limiting
+  • TLS 1.3 transport (configurable)
+  • Hash-chain verification + encrypted sensor-data streaming
+  • Structured JSON logging for SIEM integration
 """
 
 import asyncio
 import json
-import logging
 import secrets
 import sqlite3
 import struct
@@ -16,21 +20,24 @@ import time
 from typing import Dict, Tuple
 
 import msgpack
-from pqcrypto.sign.ml_dsa_65 import generate_keypair as sig_generate, sign, verify
+from pqcrypto.sign.ml_dsa_65 import sign, verify
 
 from config import (
     HOST, PORT, TIME_DELTA_SEC, DB_FILE, HASH_CHAIN_LENGTH,
-    LOG_FORMAT, PSI_LEN, NONCE_LEN, TS_LEN, ZI_LEN,
-    STREAM_PACKET_COUNT,
+    PSI_LEN, NONCE_LEN, TS_LEN, ZI_LEN,
+    STREAM_PACKET_COUNT, TLS_ENABLED,
 )
 from kem_adapter import kem_generate_keypair, kem_decaps, kem_name
+from log_setup import get_logger
+from pinned_keys import load_server_identity
 from pq_commons import (
     aead_encrypt, aead_decrypt, hkdf_sha256, sha256, b32,
     Timer, pack, unpack,
 )
+from rate_limiter import RateLimiter
+from session_store import SessionStore
 
-# ── Logging ──────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+logger = get_logger("server")
 
 # ── Database ─────────────────────────────────────────────────────────────
 conn = sqlite3.connect(DB_FILE)
@@ -44,6 +51,14 @@ cursor.execute("""
     )
 """)
 conn.commit()
+
+# ── Singletons ───────────────────────────────────────────────────────────
+rate_limiter = RateLimiter()
+session_store = SessionStore()
+
+# ── Load persistent server signing identity ──────────────────────────────
+_server_sig_pk, _server_sig_sk = load_server_identity()
+logger.info("server_identity_loaded", kem=kem_name())
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -67,24 +82,90 @@ def _close(writer: asyncio.StreamWriter):
     writer.close()
 
 
+# ── Resumed session handler ──────────────────────────────────────────────
+async def _handle_resumed_session(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    psi: bytes,
+    k_sess: bytes,
+) -> None:
+    """Handle a resumed session — skip handshake, go straight to streaming."""
+    logger.info("session_resumed", psi=psi.hex()[:16])
+
+    # Receive streaming data
+    for i in range(STREAM_PACKET_COUNT):
+        try:
+            msg = await asyncio.wait_for(recv_msg(reader), timeout=10.0)
+        except (asyncio.TimeoutError, asyncio.IncompleteReadError):
+            logger.warning("stream_ended", reason="timeout_or_disconnect")
+            break
+
+        if msg.get("type") != "stream_data":
+            logger.warning("unexpected_msg", msg_type=msg.get("type"))
+            break
+
+        plaintext = aead_decrypt(
+            k_sess, msg["ad"], msg["nonce"], msg["ciphertext"],
+        )
+        payload = json.loads(plaintext.decode())
+        logger.info("sensor_data_received", seq=payload.get("seq", i), data=payload)
+
+    # Issue a fresh ticket for next resumption
+    new_ticket = session_store.issue(psi, k_sess)
+    await send_msg(writer, {"type": "new_ticket", "ticket": new_ticket})
+
+    logger.info("resumed_session_complete")
+    _close(writer)
+    await writer.wait_closed()
+
+
 # ── Client handler ───────────────────────────────────────────────────────
 async def handle_client(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
 ) -> None:
     addr = writer.get_extra_info("peername")
-    logging.info(f"[server] connection from {addr}  (KEM={kem_name()})")
+    ip = addr[0] if addr else "unknown"
+
+    # ── Rate limiting ────────────────────────────────────────────────────
+    if not rate_limiter.allow(ip):
+        logger.warning("rate_limited", ip=ip)
+        await send_msg(writer, {"type": "err", "reason": "rate-limited"})
+        _close(writer)
+        await writer.wait_closed()
+        return
+
+    logger.info("connection_accepted", peer=addr, kem=kem_name())
 
     serv_pub, serv_priv = kem_generate_keypair()
-    await send_msg(writer, {"type": "hello", "serv_pub": serv_pub})
+    await send_msg(writer, {
+        "type": "hello",
+        "serv_pub": serv_pub,
+        "sig_pk": _server_sig_pk,
+    })
 
     t = Timer()
     t.start()
 
-    # ── m1: Client → Server ──────────────────────────────────────────────
+    # ── Check for session resumption ─────────────────────────────────────
     msg = await recv_msg(reader)
+
+    if msg.get("type") == "resume":
+        ticket_id = msg.get("ticket")
+        result = session_store.resume(ticket_id) if ticket_id else None
+        if result is not None:
+            psi, k_sess = result
+            await send_msg(writer, {"type": "resume_ok"})
+            await _handle_resumed_session(reader, writer, psi, k_sess)
+            return
+        else:
+            logger.info("resume_rejected", reason="invalid_or_expired_ticket")
+            await send_msg(writer, {"type": "resume_fail"})
+            msg = await recv_msg(reader)  # client will retry with m1
+
+    # ── m1: Client → Server ──────────────────────────────────────────────
     if msg.get("type") != "m1":
-        logging.error("[server] Expected m1, got %s", msg.get("type"))
+        logger.error("invalid_message", expected="m1", got=msg.get("type"))
         await send_msg(writer, {"type": "err", "reason": "invalid-msg"})
         _close(writer)
         await writer.wait_closed()
@@ -95,7 +176,7 @@ async def handle_client(
     m1_sig_pk  = msg["sig_pk"]
 
     if not verify(m1_sig_pk, m1_payload, m1_sig):
-        logging.error("[server] Invalid m1 signature")
+        logger.error("invalid_m1_signature")
         await send_msg(writer, {"type": "err", "reason": "invalid-sig"})
         _close(writer)
         await writer.wait_closed()
@@ -118,7 +199,7 @@ async def handle_client(
     # Replay check
     t1_time = int.from_bytes(t1, "big")
     if abs(t1_time - int(time.time())) > TIME_DELTA_SEC:
-        logging.error("[server] Replay detected: t1 skew too large")
+        logger.error("replay_detected", field="t1", skew=abs(t1_time - int(time.time())))
         await send_msg(writer, {"type": "err", "reason": "replay"})
         _close(writer)
         await writer.wait_closed()
@@ -134,20 +215,18 @@ async def handle_client(
             (PSi, zi, w_i),
         )
         conn.commit()
-        logging.info("[server] Auto-provisioned new pseudonym")
+        logger.info("pseudonym_provisioned", psi=PSi.hex()[:16])
         z_i = zi
     else:
         z_i, w_i = row["z_i"], row["w_i"]
         if not secrets.compare_digest(zi, z_i):
-            logging.error("[server] Invalid z_i — authentication failed")
+            logger.error("invalid_zi", psi=PSi.hex()[:16])
             await send_msg(writer, {"type": "err", "reason": "invalid-zi"})
             _close(writer)
             await writer.wait_closed()
             return
 
-    # ── m2: Server → Client ──────────────────────────────────────────────
-    sig_pk, sig_sk = sig_generate()
-
+    # ── m2: Server → Client (signed with persistent identity) ────────────
     T  = b32()
     NS = b32()
     t2 = int(time.time()).to_bytes(TS_LEN, "big")
@@ -158,12 +237,12 @@ async def handle_client(
     nonce2, ctext2 = aead_encrypt(kdf_key, ad2, envelope)
     m2_inner  = {"ad": ad2, "nonce": nonce2, "ciphertext": ctext2}
     m2_payload = pack(m2_inner)
-    m2_sig = sign(sig_sk, m2_payload)
+    m2_sig = sign(_server_sig_sk, m2_payload)
     await send_msg(writer, {
         "type": "m2",
         "payload": m2_payload,
         "sig": m2_sig,
-        "sig_pk": sig_pk,
+        "sig_pk": _server_sig_pk,
     })
 
     K_sess = hkdf_sha256(ss + NEV + NS, info=b"kdf-sess", length=32)
@@ -171,12 +250,12 @@ async def handle_client(
     # ── m4: Client → Server (liveness challenge) ─────────────────────────
     msg = await recv_msg(reader)
     if msg.get("type") == "err":
-        logging.error("[server] Client error: %s", msg.get("reason"))
+        logger.error("client_error", reason=msg.get("reason"))
         _close(writer)
         await writer.wait_closed()
         return
     if msg.get("type") != "m4":
-        logging.error("[server] Expected m4, got %s", msg.get("type"))
+        logger.error("invalid_message", expected="m4", got=msg.get("type"))
         _close(writer)
         await writer.wait_closed()
         return
@@ -212,43 +291,50 @@ async def handle_client(
     if msg.get("type") == "hash_use":
         ok = secrets.compare_digest(sha256(msg["pre"]), head)
         await send_msg(writer, {"type": "hash_ok", "ok": ok})
-        logging.info(f"[server] hash-chain check: {ok}")
+        logger.info("hash_chain_verified", ok=ok)
 
     t.mark("handshake-complete")
-    logging.info(f"[server] handshake ~{t.marks['handshake-complete']:.2f} ms")
+    logger.info("handshake_complete", latency_ms=round(t.marks["handshake-complete"], 2))
 
     # ── Encrypted Data Streaming ─────────────────────────────────────────
-    logging.info("[server] Waiting for encrypted sensor data...")
+    logger.info("waiting_for_sensor_data")
     for i in range(STREAM_PACKET_COUNT):
         try:
             msg = await asyncio.wait_for(recv_msg(reader), timeout=10.0)
         except (asyncio.TimeoutError, asyncio.IncompleteReadError):
-            logging.warning("[server] Stream ended (timeout or disconnect)")
+            logger.warning("stream_ended", reason="timeout_or_disconnect")
             break
 
         if msg.get("type") != "stream_data":
-            logging.warning("[server] Unexpected message type: %s", msg.get("type"))
+            logger.warning("unexpected_msg", msg_type=msg.get("type"))
             break
 
         plaintext = aead_decrypt(
             K_sess, msg["ad"], msg["nonce"], msg["ciphertext"],
         )
         payload = json.loads(plaintext.decode())
-        logging.info(
-            "[server] 📡 Sensor packet #%d: %s",
-            payload.get("seq", i),
-            payload,
-        )
+        logger.info("sensor_data_received", seq=payload.get("seq", i), data=payload)
 
-    logging.info("[server] Session complete.")
+    # ── Issue session ticket for future resumption ───────────────────────
+    ticket_id = session_store.issue(PSi, K_sess)
+    await send_msg(writer, {"type": "session_ticket", "ticket": ticket_id})
+    logger.info("session_ticket_issued", psi=PSi.hex()[:16])
+
+    logger.info("session_complete")
     _close(writer)
     await writer.wait_closed()
 
 
 # ── Entry point ──────────────────────────────────────────────────────────
 async def main():
-    server = await asyncio.start_server(handle_client, HOST, PORT)
-    logging.info(f"[server] listening on {server.sockets[0].getsockname()}")
+    ssl_ctx = None
+    if TLS_ENABLED:
+        from tls_utils import get_server_ssl_context
+        ssl_ctx = get_server_ssl_context()
+        logger.info("tls_enabled", version="TLS 1.3")
+
+    server = await asyncio.start_server(handle_client, HOST, PORT, ssl=ssl_ctx)
+    logger.info("server_listening", address=server.sockets[0].getsockname())
     async with server:
         await server.serve_forever()
 
