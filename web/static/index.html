@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PQ IoT Auth Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar Controls -->
+        <aside class="sidebar">
+            <div class="brand">
+                <div class="logo-icon">🔐</div>
+                <h1>Secure IoT<br>Post-Quantum</h1>
+            </div>
+
+            <div class="control-group">
+                <h3>Server Control</h3>
+                <div class="status-indicator" id="server-status">OFFLINE</div>
+                <button id="btn-start-server" class="btn primary">Start Server</button>
+                <button id="btn-stop-server" class="btn danger">Stop Server</button>
+            </div>
+
+            <div class="control-group">
+                <h3>Client Control</h3>
+                <div class="client-actions">
+                    <button id="btn-connect-client" class="btn accent">Connect Client</button>
+                    <button id="btn-reset-state" class="btn secondary">Reset Device State</button>
+                </div>
+            </div>
+
+            <div class="stats-panel">
+                <h3>Session Stats</h3>
+                <div class="stat-row">
+                    <span>Handshakes</span>
+                    <span id="stat-handshakes">0</span>
+                </div>
+                <div class="stat-row">
+                    <span>Resumptions</span>
+                    <span id="stat-resumptions">0</span>
+                </div>
+                <div class="stat-row">
+                    <span>Avg Latency</span>
+                    <span id="stat-latency">-</span>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Topology Visualizer -->
+            <section class="visualizer-section">
+                <div class="devices-row">
+                    <div class="device-node client" id="node-client">
+                        <div class="icon">📱</div>
+                        <div class="label">IoT Client</div>
+                        <div class="ip">127.0.0.1</div>
+                    </div>
+                    
+                    <div class="connection-line-container">
+                        <div class="connection-line" id="conn-line"></div>
+                        <div class="encryption-badge" id="enc-badge">TLS 1.3 + ML-KEM</div>
+                    </div>
+
+                    <div class="device-node server" id="node-server">
+                        <div class="icon">☁️</div>
+                        <div class="label">Cloud Server</div>
+                        <div class="ip">127.0.0.1:8765</div>
+                    </div>
+                </div>
+
+                <!-- Protocol Flow Steps -->
+                <div class="flow-steps">
+                    <div class="step" data-step="hello">HELLO</div>
+                    <div class="step" data-step="m1">M1 (KEM)</div>
+                    <div class="step" data-step="m2">M2 (Auth)</div>
+                    <div class="step" data-step="m4">M4 (Live)</div>
+                    <div class="step" data-step="m5">M5 (Ack)</div>
+                    <div class="step" data-step="hash">HASH</div>
+                    <div class="step" data-step="stream">STREAM</div>
+                </div>
+            </section>
+
+            <!-- Metrics & Data -->
+            <section class="data-grid">
+                <div class="card terminal-card">
+                    <div class="card-header">
+                        <span>System Logs</span>
+                        <button class="btn-clear" id="btn-clear-logs">Clear</button>
+                    </div>
+                    <div class="terminal-window" id="log-window">
+                        <!-- Logs injected here -->
+                    </div>
+                </div>
+
+                <div class="card telemetry-card">
+                    <div class="card-header">
+                        <span>Decrypted Sensor Data</span>
+                    </div>
+                    <div class="telemetry-display" id="telemetry-display">
+                        <div class="empty-state">Waiting for stream...</div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+    <script src="app.js"></script>
+</body>
+</html>
