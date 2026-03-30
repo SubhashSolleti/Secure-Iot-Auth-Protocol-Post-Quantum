@@ -1,3 +1,4 @@
+import logging
 from typing import Tuple
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -33,9 +34,9 @@ try:
         ss_ec = ec_sk.exchange(X25519PublicKey.from_public_bytes(ct_ec))
         return HKDF(hashes.SHA256(), 32, None, b"hybrid").derive(ss_pq + ss_ec)
 
-    print("[KEM] Using hybrid ML-KEM-768 + X25519")
+    logging.info("[KEM] Using hybrid ML-KEM-768 + X25519")
 except Exception as e:
-    print(f"[KEM] Hybrid failed: {e}")
+    logging.warning(f"[KEM] Hybrid mode unavailable: {e}")
     # --- Fallback: Pure ML-KEM-768 ---
     try:
         from pqcrypto.kem.ml_kem_768 import generate_keypair, encrypt, decrypt
@@ -43,7 +44,7 @@ except Exception as e:
         def kem_generate_keypair() -> Tuple[bytes, bytes]: return generate_keypair()
         def kem_encaps(pk: bytes) -> Tuple[bytes, bytes]: return encrypt(pk)
         def kem_decaps(sk: bytes, ct: bytes) -> bytes: return decrypt(sk, ct)
-        print("[KEM] Fallback to pure ML-KEM-768")
+        logging.info("[KEM] Fallback to pure ML-KEM-768")
     except Exception as e2:
-        print(f"[KEM] Pure fallback also failed: {e2}")
+        logging.error(f"[KEM] All KEM backends failed: {e2}")
         raise

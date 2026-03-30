@@ -1,0 +1,15 @@
+# Generated runtime data
+client_data/
+server_data/
+server_pseudonyms.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
