@@ -48,7 +48,28 @@ def aead_decrypt(key: bytes, ad: bytes, nonce: bytes, ciphertext: bytes) -> byte
     return aes.decrypt(nonce, ciphertext, ad)
 
 def derive_pseudonym(id_real: bytes, sd: bytes, a_i: bytes) -> bytes:
+    """Derive a per-session unlinkable pseudonym (PSi_session).
+
+    Different A_i values produce different pseudonyms, preventing
+    cross-session linkability by the server or intermediaries.
+    """
     mix = sha256(sd + a_i)
+    return sha256(id_real + mix)
+
+
+def derive_stable_pseudonym(id_real: bytes, sd: bytes) -> bytes:
+    """Derive a stable pseudonym (PSi_stable) for sanctions screening.
+
+    Uses a fixed domain separator instead of per-session A_i.
+    PSi_stable is consistent across sessions, allowing intermediaries
+    to screen against pre-loaded sanctions lists without learning ID_REAL.
+
+    Privacy tradeoff: PSi_stable IS linkable across sessions by design.
+    This is strictly better than full identity exposure (intermediary
+    cannot learn name, DOB, address) but weaker than per-session
+    unlinkability.
+    """
+    mix = sha256(sd + b"stable-screening-domain-v1")
     return sha256(id_real + mix)
 
 async def send_msg(writer: asyncio.StreamWriter, obj: dict):

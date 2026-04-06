@@ -8,7 +8,7 @@ from collections import defaultdict
 from kem_adapter import kem_generate_keypair, kem_decaps, kem_name
 from pq_commons import (
     aead_encrypt, aead_decrypt, hkdf_sha256, sha256, b32, Timer,
-    pack, unpack, send_msg, recv_msg
+    pack, unpack, send_msg, recv_msg, derive_stable_pseudonym
 )
 from identity import IdentityManager
 
@@ -32,24 +32,39 @@ conn = sqlite3.connect(DB_FILE)
 conn.row_factory = sqlite3.Row
 cursor = conn.cursor()
 
-# Schema: includes sig_pk column for TOFU identity binding
+# Schema: psi_stable is the persistent FK; psi_session varies per session
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS pseudonyms (
-    psi    BLOB PRIMARY KEY,
-    z_i    BLOB,
-    w_i    BLOB,
-    sig_pk BLOB
+    psi_stable BLOB PRIMARY KEY,
+    z_i        BLOB,
+    w_i        BLOB,
+    sig_pk     BLOB
 )
 """)
 conn.commit()
 
-# Migration: add sig_pk column to existing databases
+# Migration: rename psi → psi_stable for existing databases
+try:
+    cursor.execute("SELECT psi_stable FROM pseudonyms LIMIT 1")
+except sqlite3.OperationalError:
+    # Old schema had 'psi' column — rebuild table
+    try:
+        cursor.execute("ALTER TABLE pseudonyms RENAME COLUMN psi TO psi_stable")
+        conn.commit()
+        logging.info("[server] Migrated DB: renamed psi → psi_stable")
+    except sqlite3.OperationalError:
+        pass  # Column already correct or table empty
+
+# Migration: add sig_pk column to existing databases (legacy compat)
 try:
     cursor.execute("SELECT sig_pk FROM pseudonyms LIMIT 1")
 except sqlite3.OperationalError:
-    cursor.execute("ALTER TABLE pseudonyms ADD COLUMN sig_pk BLOB")
-    conn.commit()
-    logging.info("[server] Migrated DB: added sig_pk column")
+    try:
+        cursor.execute("ALTER TABLE pseudonyms ADD COLUMN sig_pk BLOB")
+        conn.commit()
+        logging.info("[server] Migrated DB: added sig_pk column")
+    except sqlite3.OperationalError:
+        pass
 
 
 # ── Rate limiter ──
@@ -118,7 +133,14 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
         ss = kem_decaps(serv_priv, ct)
         pt = aead_decrypt(hkdf_sha256(ss, info=b"kdf-ss"), ad=ad, nonce=nonce, ciphertext=ctext)
+        # Tiered Pseudonym Architecture:
+        #   PSi (session) = pt[0:32]   — unique per-session (unlinkable)
+        #   PSi_stable    = pt[104:136] — fixed per-device (for screening / DB lookup)
         PSi = pt[0:32]; NEV = pt[32:64]; t1 = pt[64:72]; zi = pt[72:104]
+        PSi_stable = pt[104:136] if len(pt) >= 136 else PSi  # backward compat
+
+        logging.info(f"[server] PSi_session: {PSi.hex()[:12]}... (per-session)")
+        logging.info(f"[server] PSi_stable:  {PSi_stable.hex()[:12]}... (for screening)")
 
         # Replay detection via timestamp
         t1_time = int.from_bytes(t1, "big")
@@ -129,10 +151,11 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             return
 
         # ─── TOFU identity binding + pseudonym lookup (under lock) ───
+        # DB lookup uses PSi_stable (persistent) not PSi_session (ephemeral)
         is_new_client = False
         async with db_lock:
             cursor.execute(
-                "SELECT z_i, w_i, sig_pk FROM pseudonyms WHERE psi = ?", (PSi,)
+                "SELECT z_i, w_i, sig_pk FROM pseudonyms WHERE psi_stable = ?", (PSi_stable,)
             )
             row = cursor.fetchone()
 
@@ -140,13 +163,13 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 # First encounter: auto-provision with TOFU
                 w_i = b32()
                 cursor.execute(
-                    "INSERT INTO pseudonyms (psi, z_i, w_i, sig_pk) VALUES (?, ?, ?, ?)",
-                    (PSi, zi, w_i, bytes(m1_sig_pk))
+                    "INSERT INTO pseudonyms (psi_stable, z_i, w_i, sig_pk) VALUES (?, ?, ?, ?)",
+                    (PSi_stable, zi, w_i, bytes(m1_sig_pk))
                 )
                 conn.commit()
                 is_new_client = True
                 z_i = zi
-                logging.info("[server] Auto-provisioned PSi with TOFU identity binding")
+                logging.info("[server] Auto-provisioned PSi_stable with TOFU identity binding")
             else:
                 z_i, w_i = row["z_i"], row["w_i"]
                 stored_sig_pk = row["sig_pk"]
@@ -234,7 +257,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             prov_wi = sha256(bytes(w_i) + T)
             async with db_lock:
                 cursor.execute(
-                    "UPDATE pseudonyms SET w_i = ? WHERE psi = ?", (prov_wi, PSi)
+                    "UPDATE pseudonyms SET w_i = ? WHERE psi_stable = ?", (prov_wi, PSi_stable)
                 )
                 conn.commit()
             logging.info("[server] Rotated w_i for returning client")

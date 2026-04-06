@@ -124,12 +124,27 @@ PQ-PKAP KYC:                PA verifies → issues z_i → S authenticates → P
 
 The PMLA allows regulated entities (REs) to rely on certified intermediaries for KYC (§11A). PA maps to this certified intermediary role.
 
-### 4.3 Transaction Monitoring Without Identity Exposure
+### 4.3 Transaction Monitoring and Sanctions Screening Without Identity Exposure
 
-AML pattern detection can occur at the `PSi` level:
-- Velocity limits (number of sessions per `PSi` per hour)
+PQ-PKAP uses a **tiered pseudonym architecture** to enable AML compliance without identity leakage:
+
+```
+Traditional Flow:     Bank → "Alice Sharma, DOB 1990, Aadhaar 1234" → Sanctions Vendor
+PQ-PKAP Flow:         Bank → "PSi_stable 0x3fa8c2e1..."            → Sanctions Vendor
+```
+
+**Sanctions screening via PSi_stable**:
+- PA computes `PSi_stable` for each sanctioned person and distributes to intermediaries
+- Intermediary matches incoming `PSi_stable` against pre-loaded pseudonymized sanctions list
+- Intermediary returns CLEAN/FLAGGED without ever seeing name, DOB, address, or national ID
+
+**AML pattern detection at the PSi_stable level**:
+- Velocity limits (number of sessions per `PSi_stable` per hour)
 - Anomalous session timing patterns
-- Cross-device correlation (same `PSi`, different network origin)
+- Cross-device correlation (same `PSi_stable`, different network origin)
+- Transaction amount monitoring per `PSi_stable`
+
+**Privacy tradeoff**: `PSi_stable` is linkable across sessions (intermediary can count screenings) but cannot be reversed to a real identity. This is strictly better than full name-based screening.
 
 Only when a pattern crosses STR thresholds is the PA queried for `ID_REAL` de-anonymization.
 
@@ -185,8 +200,9 @@ PQ-PKAP achieves **NIST Post-Quantum Migration** compliance by using exclusively
 
 | Risk | Impact | Mitigation in PQ-PKAP |
 |---|---|---|
-| **PA compromise**: adversary gains `ID_REAL → PSi` mapping | High — full de-anonymization | PA is out-of-scope of protocol; must apply HSM + access controls |
-| **`A_i` reuse**: same session params → same `PSi` | Linkability within reuse scope | Protocol MUST enforce rotation of `A_i` per session (design requirement) |
+| **PA compromise**: adversary gains `ID_REAL → PSi` mapping | High — full de-anonymization | PA is out-of-scope of protocol; must apply HSM + access controls. Future: threshold PA (2-of-3) |
+| **`A_i` reuse**: same session params → same `PSi_session` | Linkability within reuse scope | Protocol enforces rotation of `A_i` per session in `client.py` |
+| **PSi_stable linkability**: intermediary can count screenings | Low — no identity revealed | Deliberate design tradeoff; intermediary learns frequency but not identity |
 | **`z_i` leakage from server DB** | Client can be impersonated | `z_i` is verified but not sufficient alone; requires `sk_C` signing key too |
 | **Quantum advancement**: SHA-256 weakened | Pseudonymity weakened under Grover | SHA-256 hash output collision: 2^128 ops — acceptable under NIST guidance |
 | **Regulatory uncertainty (DPDPA implementation)** | Future compliance gaps | Design follows GDPR parity (DPDPA aligns closely with GDPR) |

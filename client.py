@@ -6,7 +6,7 @@ from pathlib import Path
 from kem_adapter import kem_encaps, kem_name
 from pq_commons import (
     aead_encrypt, aead_decrypt, hkdf_sha256, sha256,
-    derive_pseudonym, b32, Timer, pack, unpack,
+    derive_pseudonym, derive_stable_pseudonym, b32, Timer, pack, unpack,
     send_msg, recv_msg
 )
 from identity import IdentityManager
@@ -30,7 +30,14 @@ def load_or_create_device_secrets() -> dict:
     if secrets_path.exists():
         with open(secrets_path) as f:
             data = json.load(f)
-        logging.info("[client] Loaded existing device secrets")
+        # Rotate A_i for EVERY session to enforce per-session unlinkability (G1).
+        # PSi_session = SHA-256(ID_REAL || SHA-256(SD || A_i)) will be unique each time.
+        # PSi_stable  = SHA-256(ID_REAL || SHA-256(SD || "stable")) remains fixed for screening.
+        data["a_i"] = os.urandom(32).hex()
+        with open(secrets_path, "w") as f:
+            json.dump(data, f, indent=2)
+        os.chmod(secrets_path, 0o600)
+        logging.info("[client] Loaded device secrets — rotated A_i for new session")
         return {k: bytes.fromhex(v) for k, v in data.items()}
 
     device = {
@@ -92,7 +99,14 @@ async def run_client():
         t = Timer(); t.start()
 
         # ─────────────────────── m1 (send) ───────────────────────
+        # Tiered Pseudonym Architecture:
+        #   PSi_session = unique per-session (unlinkable — G1)
+        #   PSi_stable  = fixed per-device (for intermediary screening)
         PSi = derive_pseudonym(device["id_real"], device["sd"], device["a_i"])
+        PSi_stable = derive_stable_pseudonym(device["id_real"], device["sd"])
+        logging.info(f"[client] PSi_session: {PSi.hex()[:12]}... (per-session)")
+        logging.info(f"[client] PSi_stable:  {PSi_stable.hex()[:12]}... (for screening)")
+
         NEV = b32()
         t1  = int(time.time()).to_bytes(8, "big")
         zi  = device["z_i"]
@@ -100,7 +114,9 @@ async def run_client():
         ct, ss = kem_encaps(serv_pub)
 
         ad  = PSi
-        env = PSi + NEV + t1 + zi
+        # Include PSi_stable in encrypted envelope — server can extract
+        # for intermediary forwarding but it's not visible on the wire
+        env = PSi + NEV + t1 + zi + PSi_stable
         nonce, ctext = aead_encrypt(hkdf_sha256(ss, info=b"kdf-ss"), ad, env)
 
         m1_inner   = {"ct": ct, "ad": ad, "nonce": nonce, "ciphertext": ctext}

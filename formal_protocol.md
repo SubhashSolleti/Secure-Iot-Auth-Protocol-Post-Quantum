@@ -13,7 +13,8 @@
 | `ID_REAL` | bytes(32) | Client's real identity (e.g., Aadhaar hash, PAN hash) |
 | `SD` | bytes(32) | Client-controlled device/session salt — never leaves client |
 | `A_i` | bytes(32) | Per-session attester nonce — refreshed per connection |
-| `PSi` | bytes(32) | Derived pseudonym: `SHA-256(ID_REAL ‖ SHA-256(SD ‖ A_i))` |
+| `PSi` | bytes(32) | Per-session derived pseudonym: `SHA-256(ID_REAL ‖ SHA-256(SD ‖ A_i))` |
+| `PSi_stable` | bytes(32) | Stable screening pseudonym: `SHA-256(ID_REAL ‖ SHA-256(SD ‖ "stable"))` |
 | `z_i` | bytes(32) | Client secret token registered during KYC onboarding |
 | `w_i` | bytes(32) | Server-provisioned mutual authentication secret (per-session rotated) |
 | `T` | bytes(32) | Per-session random token (server-generated, used in w_i rotation) |
@@ -137,18 +138,51 @@ PA performs:
   6. C persists: {ID_REAL, SD, A_i, z_i, pk_C, sk_C} (0o600 permissions)
 ```
 
-### 4.2 Pseudonym Derivation
+### 4.2 Pseudonym Derivation (Tiered Architecture)
 
-Client MUST compute `PSi` locally, never transmitting `ID_REAL`:
+PQ-PKAP uses a **two-tier pseudonym architecture** to simultaneously achieve per-session unlinkability (for authentication) and consistent sanctions screening (for AML compliance):
+
+#### Tier 1: Session Pseudonym (PSi_session) — Unlinkable
+
+Client MUST compute a fresh `PSi` per session, never transmitting `ID_REAL`:
 
 ```
-PSi := SHA-256(ID_REAL ‖ SHA-256(SD ‖ A_i))
+A_i  := random(32)                           [Fresh per session — MUST rotate]
+PSi  := SHA-256(ID_REAL ‖ SHA-256(SD ‖ A_i))
 ```
 
-**Security properties of this construction**:
+**Security properties**:
 - `SHA-256(SD ‖ A_i)` acts as a domain separator; different `A_i` → different inner hash
 - `SHA-256(ID_REAL ‖ …)` provides second preimage resistance: given `PSi`, adversary cannot recover `ID_REAL` without knowing `SD` and `A_i`
 - Server cannot correlate two sessions with different `A_i` even if it knows `PSi` for each
+
+#### Tier 2: Stable Pseudonym (PSi_stable) — For Screening
+
+Client also computes a **fixed** pseudonym for intermediary sanctions screening:
+
+```
+PSi_stable := SHA-256(ID_REAL ‖ SHA-256(SD ‖ "stable-screening-domain-v1"))
+```
+
+**Security properties**:
+- `PSi_stable` is consistent across sessions (same ID_REAL + SD → same output)
+- Intermediary can match against pre-loaded sanctions pseudonyms without learning `ID_REAL`
+- The domain separator `"stable-screening-domain-v1"` prevents collision with session pseudonyms
+
+**Privacy tradeoff (explicit)**:
+- `PSi_stable` IS linkable across sessions by design — the intermediary can observe that the same entity was screened multiple times
+- However, the intermediary **cannot learn** the customer's name, DOB, national ID, or address
+- This is **strictly better** than the status quo where full PII is shared with every intermediary
+- Per-session unlinkability is preserved at the authentication layer via `PSi_session`
+
+#### Tiered Flow in Protocol
+
+```
+Client → Server:   m1 envelope contains {PSi_session, ..., PSi_stable}  [encrypted]
+Server → Interm.:  forwards PSi_stable only                             [for screening]
+Interm. → Server:  returns CLEAN / FLAGGED                              [no identity]
+Server:            uses PSi_stable as DB FK, PSi_session for session binding
+```
 
 ### 4.3 Five-Message Handshake
 
@@ -299,7 +333,7 @@ This forms a one-way ratchet: forward compromise of `w_i_new` does not reveal `w
 
 **Argument**: The inner hash `H(SD ‖ A_i)` is indistinguishable from a uniform 32-byte string to any party not knowing `SD`. The outer hash `H(ID_REAL ‖ ·)` then acts as a PRF with key `ID_REAL`. Since each session uses a fresh `A_i`, the outputs are computationally independent under SHA-256 second-preimage resistance.
 
-**Limitation**: Unlinkability requires fresh `A_i` per session. If `A_i` is reused, linkability follows by direct equality of `PSi`.
+**Limitation**: Unlinkability applies to `PSi_session` only. `PSi_stable` is deliberately linkable across sessions to enable consistent sanctions screening. The stable pseudonym reveals session frequency to the intermediary but not identity.
 
 ### 5.2 Forward Secrecy
 
